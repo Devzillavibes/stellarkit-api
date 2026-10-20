@@ -6546,6 +6546,314 @@ router.get("/:id/smart-contract-interactions", async (req, res, next) => {
   }
 });
 
+/**
+ * GET /account/:id/sep10-challenge
+ *
+ * Generates a SEP-10 Web Authentication challenge for the given account.
+ * The challenge is a base64-encoded Stellar transaction XDR that the client
+ * must sign with its private key to prove account ownership.
+ *
+ * The challenge is valid for 15 minutes from the time of the request.
+ * Each call generates a unique challenge (random nonce via Keypair.random()).
+ *
+ * Response shape:
+ *   {
+ *     success: true,
+ *     data: {
+ *       accountId: string,
+ *       challengeXdr: string,   // base64-encoded transaction envelope XDR
+ *       expiresAt: string,      // ISO 8601, exactly 15 minutes from request time
+ *       network: string         // value of STELLAR_NETWORK env var ("testnet" or "mainnet")
+ *     }
+ *   }
+ *
+ * Returns 404 when the account does not exist.
+ *
+ * @example
+ *   GET /account/GABC.../sep10-challenge
+ */
+router.get("/:id/sep10-challenge", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    // Verify the account exists before issuing a challenge
+    await withHorizonTiming(req, () => server.loadAccount(id));
+
+    const { Keypair, TransactionBuilder, Networks, BASE_FEE, Operation } = require("@stellar/stellar-sdk");
+
+    const CHALLENGE_VALIDITY_MS = 15 * 60 * 1000; // 15 minutes
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + CHALLENGE_VALIDITY_MS);
+
+    // Determine the network passphrase from STELLAR_NETWORK env var
+    const networkName = (process.env.STELLAR_NETWORK || NETWORK || "testnet").toLowerCase();
+    const networkPassphrase =
+      networkName === "mainnet"
+        ? Networks.PUBLIC
+        : Networks.TESTNET;
+
+    // A unique, server-managed keypair is required to build the challenge transaction.
+    // We generate an ephemeral server keypair per request so each challenge is unique.
+    const serverKeypair = Keypair.random();
+
+    // We need a minimal account object to build the transaction.
+    // We use a synthetic account with sequence 0 for the server keypair.
+    const { Account } = require("@stellar/stellar-sdk");
+    const serverAccount = new Account(serverKeypair.publicKey(), "0");
+
+    // Build a challenge transaction:
+    //   - Source: ephemeral server keypair
+    //   - Operation: manage_data with nonce = random bytes
+    //   - Time bounds: [now, now + 15 min]
+    const nonce = Keypair.random().rawPublicKey().toString("base64");
+
+    const tx = new TransactionBuilder(serverAccount, {
+      fee: BASE_FEE,
+      networkPassphrase,
+    })
+      .addOperation(
+        Operation.manageData({
+          name: `${networkName} auth`,
+          value: nonce,
+          source: id,
+        })
+      )
+      .setTimebounds(
+        Math.floor(now.getTime() / 1000),
+        Math.floor(expiresAt.getTime() / 1000)
+      )
+      .build();
+
+    // Sign the challenge with the ephemeral server key
+    tx.sign(serverKeypair);
+
+    const challengeXdr = tx.toEnvelope().toXDR("base64");
+
+    return success(res, {
+      accountId: id,
+      challengeXdr,
+      expiresAt: expiresAt.toISOString(),
+      network: networkName,
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
+ * GET /account/:id/sponsorship-costs
+ *
+ * Returns the total number of entries the account is sponsoring, the total
+ * XLM locked as base reserves for those entries, and a breakdown by entry type.
+ *
+ * Stellar protocol: each sponsored entry locks 0.5 XLM (one base reserve)
+ * in the sponsor's account.
+ *
+ * Response shape:
+ *   {
+ *     success: true,
+ *     data: {
+ *       accountId: string,
+ *       totalSponsoring: number,
+ *       totalLockedXLM: string,        // seven-decimal string
+ *       breakdown: [
+ *         { type: string, count: number, lockedXLM: string }
+ *       ]
+ *     }
+ *   }
+ *
+ * Returns { totalSponsoring: 0, totalLockedXLM: "0.0000000" } when the account
+ * sponsors nothing. Returns 404 when the account does not exist.
+ *
+ * @example
+ *   GET /account/GABC.../sponsorship-costs
+ */
+router.get("/:id/sponsorship-costs", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    // Fetch account and the list of accounts it is currently sponsoring
+    const [account, sponsoredAccountsResponse] = await Promise.all([
+      withHorizonTiming(req, () => server.loadAccount(id)),
+      server.accounts().sponsor(id).call().catch(() => ({ records: [] })),
+    ]);
+
+    const BASE_RESERVE_XLM = 0.5;
+    const counts = {
+      trustline: 0,
+      signer: 0,
+      data_entry: 0,
+      offer: 0,
+      account: 0,
+    };
+
+    // accounts().sponsor(id) returns accounts whose base reserve is sponsored
+    // by `id` — each such account locks 2 base reserves (1 for the account
+    // itself + 1 for its base reserve entry).
+    const sponsoredAccounts = (sponsoredAccountsResponse.records || []);
+    counts.account = sponsoredAccounts.length;
+
+    let trustlineCount = 0;
+    let signerCount = 0;
+    let dataEntryCount = 0;
+    let offerCount = 0;
+
+    // Fetch each sponsored account's details to count sub-entries sponsored by `id`
+    if (sponsoredAccounts.length > 0) {
+      const sponsoredDetails = await Promise.allSettled(
+        sponsoredAccounts.slice(0, 20).map((acc) =>
+          server.loadAccount(acc.id).catch(() => null)
+        )
+      );
+
+      for (const result of sponsoredDetails) {
+        if (result.status !== "fulfilled" || !result.value) continue;
+        const acc = result.value;
+
+        (acc.balances || []).forEach((b) => {
+          if (b.sponsor === id) trustlineCount++;
+        });
+        (acc.signers || []).forEach((s) => {
+          if (s.sponsor === id) signerCount++;
+        });
+        if (acc.data_attr) {
+          const dataSponsors = acc.data_sponsors || {};
+          Object.keys(acc.data_attr).forEach((key) => {
+            if (dataSponsors[key] === id) dataEntryCount++;
+          });
+        }
+      }
+    }
+
+    // Check offers sponsored by this account
+    try {
+      const offersResponse = await server.offers().sponsor(id).limit(200).call();
+      offerCount = (offersResponse.records || []).length;
+    } catch (_) {
+      offerCount = 0;
+    }
+
+    const breakdown = [];
+    const accountCost = counts.account * 2 * BASE_RESERVE_XLM;
+    if (counts.account > 0) {
+      breakdown.push({
+        type: "account",
+        count: counts.account,
+        lockedXLM: toSevenDecimalString(accountCost),
+      });
+    }
+    if (trustlineCount > 0) {
+      breakdown.push({
+        type: "trustline",
+        count: trustlineCount,
+        lockedXLM: toSevenDecimalString(trustlineCount * BASE_RESERVE_XLM),
+      });
+    }
+    if (signerCount > 0) {
+      breakdown.push({
+        type: "signer",
+        count: signerCount,
+        lockedXLM: toSevenDecimalString(signerCount * BASE_RESERVE_XLM),
+      });
+    }
+    if (dataEntryCount > 0) {
+      breakdown.push({
+        type: "data_entry",
+        count: dataEntryCount,
+        lockedXLM: toSevenDecimalString(dataEntryCount * BASE_RESERVE_XLM),
+      });
+    }
+    if (offerCount > 0) {
+      breakdown.push({
+        type: "offer",
+        count: offerCount,
+        lockedXLM: toSevenDecimalString(offerCount * BASE_RESERVE_XLM),
+      });
+    }
+
+    const totalSponsoring =
+      counts.account + trustlineCount + signerCount + dataEntryCount + offerCount;
+    const totalLockedXLM =
+      accountCost +
+      trustlineCount * BASE_RESERVE_XLM +
+      signerCount * BASE_RESERVE_XLM +
+      dataEntryCount * BASE_RESERVE_XLM +
+      offerCount * BASE_RESERVE_XLM;
+
+    return success(res, {
+      accountId: id,
+      totalSponsoring,
+      totalLockedXLM: toSevenDecimalString(totalLockedXLM),
+      breakdown,
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
+ * GET /account/:id/trustline-limits
+ *
+ * Returns all trustlines for an account with their limit, balance, used
+ * percentage, remaining capacity, and a nearLimit flag when usage exceeds 90%.
+ *
+ * - usedPercent = (balance / limit) * 100, rounded to 2 decimal places
+ * - remaining   = limit - balance  (seven-decimal string)
+ * - nearLimit   = true when usedPercent > 90
+ *
+ * Response shape:
+ *   {
+ *     success: true,
+ *     data: {
+ *       trustlines: [
+ *         { asset, balance, limit, usedPercent, remaining, nearLimit }
+ *       ]
+ *     }
+ *   }
+ *
+ * Returns { trustlines: [] } for accounts with no trustlines.
+ * Returns 404 when the account does not exist.
+ *
+ * @example
+ *   GET /account/GABC.../trustline-limits
+ */
+router.get("/:id/trustline-limits", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const account = await withHorizonTiming(req, () => server.loadAccount(id));
+
+    const trustlines = (account.balances || [])
+      .filter((b) => isNonNativeAsset(b))
+      .map((b) => {
+        const balance = parseFloat(b.balance || "0");
+        const limit = parseFloat(b.limit || "0");
+        const remaining = Math.max(0, limit - balance);
+        const usedPercent =
+          limit > 0
+            ? Math.round((balance / limit) * 100 * 100) / 100
+            : 0;
+        const nearLimit = usedPercent > 90;
+
+        return {
+          asset: normalizeAsset(b.asset_code, b.asset_issuer, b.asset_type),
+          balance: toSevenDecimalString(balance),
+          limit: toSevenDecimalString(limit),
+          usedPercent,
+          remaining: toSevenDecimalString(remaining),
+          nearLimit,
+        };
+      });
+
+    return success(res, { trustlines });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
 module.exports = router;
 
 // SHELL_SYNC_MARKER
