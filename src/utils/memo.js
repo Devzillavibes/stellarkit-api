@@ -142,47 +142,66 @@ function validateMemo(type, value) {
     if (value !== undefined && value !== null && value !== "") {
       errors.push("A 'none' memo must not carry a value");
     }
-  } else if (typeof value !== "string" || value === "") {
-    errors.push(`Missing memo value for ${t} type`);
-  } else if (t === "text") {
-    byteLength = Buffer.byteLength(value, "utf8");
-    if (byteLength > TEXT_MEMO_MAX_BYTES) {
-      errors.push(`Text memo exceeds the ${TEXT_MEMO_MAX_BYTES}-byte limit (max ${TEXT_MEMO_MAX_BYTES} bytes, got ${byteLength} bytes).`);
-    }
-  } else if (t === "id") {
-    if (!/^[0-9]+$/.test(value)) {
-      errors.push("ID memo must be an unsigned integer (64-bit, decimal form).");
-    } else if (BigInt(value) > UINT64_MAX) {
-      errors.push("ID memo must be within the unsigned 64-bit integer range.");
-    } else {
-      byteLength = 8;
-    }
-  } else {
-    // hash / return — accept even-length hex or valid base64
-    let bytes;
-    if (/^[0-9a-fA-F]+$/.test(value) && value.length % 2 === 0) {
-      bytes = Buffer.from(value, "hex");
-    } else if (/^[A-Za-z0-9+/]*={0,2}$/.test(value) && value.length % 4 === 0) {
-      bytes = Buffer.from(value, "base64");
-    }
-    if (bytes) {
-      byteLength = bytes.length;
-      if (bytes.length !== HASH_MEMO_BYTES) {
-        errors.push(`${t === "hash" ? "Hash" : "Return"} memo must be exactly ${HASH_MEMO_BYTES} bytes (got ${byteLength}).`);
-      }
-    } else {
-      errors.push(`${t === "hash" ? "Hash" : "Return"} memo must be a 64-character hex string or valid base64 encoding.`);
-    }
+    return { valid: true, type: "none", value: null, byteLength: 0, error: null };
   }
 
-  return {
-    valid: errors.length === 0,
-    type: t,
-    value: value ?? null,
-    byteLength,
-    error: errors[0] ?? null,
-    errors,
-  };
+  if (t === "text") {
+    if (typeof value !== "string" || value === "") {
+      return invalidMemo(t, value, "Missing memo value for text type");
+    }
+    const byteLength = Buffer.byteLength(value, "utf8");
+    if (byteLength > TEXT_MEMO_MAX_BYTES) {
+      return invalidMemo(
+        t,
+        value,
+        `Text memo must not exceed ${TEXT_MEMO_MAX_BYTES} bytes (got ${byteLength})`,
+        byteLength
+      );
+    }
+    return { valid: true, type: "text", value, byteLength, error: null };
+  }
+
+  if (t === "id") {
+    if (typeof value !== "string" || value === "") {
+      return invalidMemo(t, value, "Missing memo value for id type");
+    }
+    if (!/^[0-9]+$/.test(value)) {
+      return invalidMemo(t, value, "ID memo must be an unsigned integer string");
+    }
+    if (BigInt(value) > UINT64_MAX) {
+      return invalidMemo(t, value, "ID memo must fit in an unsigned 64-bit integer");
+    }
+    return { valid: true, type: "id", value, byteLength: null, error: null };
+  }
+
+  // hash / return
+  if (typeof value !== "string" || value === "") {
+    return invalidMemo(t, value, `Missing memo value for ${t} type`);
+  }
+
+  let bytes;
+  if (/^[0-9a-fA-F]{64}$/.test(value)) {
+    bytes = Buffer.from(value, "hex");
+  } else if (/^[A-Za-z0-9+/]*={0,2}$/.test(value) && value.length % 4 === 0) {
+    bytes = Buffer.from(value, "base64");
+  } else {
+    return invalidMemo(
+      t,
+      value,
+      "Memo value must be a 64-character hex string or a valid base64 string"
+    );
+  }
+
+  if (bytes.length !== HASH_MEMO_BYTES) {
+    return invalidMemo(
+      t,
+      value,
+      `Hash memo must be exactly ${HASH_MEMO_BYTES} bytes (got ${bytes.length})`,
+      bytes.length
+    );
+  }
+
+  return { valid: true, type: t, value, byteLength: bytes.length, error: null };
 }
 
 module.exports = { decodeMemo, validateMemo, TEXT_MEMO_MAX_BYTES, HASH_MEMO_BYTES };
