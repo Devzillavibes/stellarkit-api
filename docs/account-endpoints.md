@@ -18,7 +18,10 @@ The `:id` path parameter is always a 56-character Stellar public key starting wi
 | Show offer history (created/updated/deleted) | `GET /account/:id/offer-history` |
 | Inspect multisig configuration | `GET /account/:id/signers` |
 | Run a KYC / compliance check | `GET /account/:id/risk-score` |
+| Detect unusual transaction rates | `GET /account/:id/transaction-velocity` |
 | Display recent trades | `GET /account/:id/trades` |
+| See when an account is most active | `GET /account/:id/activity-heatmap` |
+| Measure portfolio diversification | `GET /account/:id/asset-diversity` |
 
 ---
 
@@ -329,6 +332,107 @@ curl "http://localhost:3000/account/GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER
 
 ---
 
+## Use case: Analytics — activity patterns and portfolio diversification
+
+These endpoints summarise an account's behaviour rather than listing raw records. They are intended for analytics tools, wallet dashboards, and financial reporting.
+
+### `GET /account/:id/activity-heatmap`
+
+Returns a 7×24 matrix of transaction counts by day of week and hour of day, computed from the account's recent transaction history. Use this to show when an account is most active — for example, a "when do I transact?" chart in a wallet app.
+
+**Query params:**
+
+| Param | Type | Description |
+|---|---|---|
+| `days` | integer | Lookback period in days. Defaults to `30`. |
+
+**Response fields:**
+
+| Field | Type | Description |
+|---|---|---|
+| `accountId` | string | The account the heatmap was computed for |
+| `heatmap` | object | Keys `monday` … `sunday`; each value is an array of exactly 24 hourly transaction counts (index `0` = 00:00–00:59, index `23` = 23:00–23:59) |
+| `peakDay` | string | Day of week with the highest total transaction count |
+| `peakHour` | integer | Hour of day (0–23) with the highest total transaction count across all days |
+| `totalAnalysed` | integer | Total number of transactions included in the analysis |
+
+Returns `404 AccountNotFound` when the account does not exist.
+
+```bash
+# Default 30-day lookback
+curl "http://localhost:3000/account/GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN/activity-heatmap"
+
+# Last 7 days only
+curl "http://localhost:3000/account/GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN/activity-heatmap?days=7"
+```
+
+```json
+{
+  "success": true,
+  "data": {
+    "accountId": "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN",
+    "heatmap": {
+      "monday":    [0, 0, 0, 0, 0, 0, 0, 0, 1, 3, 2, 0, 0, 1, 4, 2, 0, 0, 0, 0, 0, 0, 0, 0],
+      "tuesday":   [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+      "wednesday": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+      "thursday":  [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+      "friday":    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+      "saturday":  [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+      "sunday":    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    },
+    "peakDay": "monday",
+    "peakHour": 14,
+    "totalAnalysed": 14
+  }
+}
+```
+
+---
+
+### `GET /account/:id/asset-diversity`
+
+Measures how diversified an account's asset holdings are. The score is based on the number of distinct assets held, their relative weights, and the Herfindahl-Hirschman Index (HHI) — a standard measure of market concentration. Both the raw HHI and a human-readable `diversityLevel` are returned.
+
+**Response fields:**
+
+| Field | Type | Description |
+|---|---|---|
+| `accountId` | string | The account the analysis was computed for |
+| `assetCount` | integer | Number of distinct assets held |
+| `hhi` | number | Herfindahl-Hirschman Index, computed from the squared portfolio percentages (range 0–10000) |
+| `diversityLevel` | string | `"concentrated"` when `hhi > 2500`, `"moderate"` when `hhi` is 1000–2500, `"diversified"` when `hhi < 1000` |
+| `breakdown` | array | Per-asset entries, each with `asset` and `portfolioPercent` |
+
+Returns `404 AccountNotFound` when the account does not exist.
+
+```bash
+curl "http://localhost:3000/account/GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN/asset-diversity"
+```
+
+```json
+{
+  "success": true,
+  "data": {
+    "accountId": "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN",
+    "assetCount": 3,
+    "hhi": 4235.5,
+    "diversityLevel": "concentrated",
+    "breakdown": [
+      { "asset": { "code": "XLM", "issuer": null, "type": "native" }, "portfolioPercent": 60.0 },
+      { "asset": { "code": "USDC", "issuer": "GA5Z...", "type": "credit_alphanum4" }, "portfolioPercent": 30.0 },
+      { "asset": { "code": "AQUA", "issuer": "GBNZ...", "type": "credit_alphanum4" }, "portfolioPercent": 10.0 }
+    ]
+  }
+}
+```
+
+**Interpreting `diversityLevel`:**
+- `"concentrated"` — one asset dominates the portfolio; a single price move drives most of the account's value.
+- `"moderate"` — holdings are spread across a few assets but still meaningfully weighted.
+- `"diversified"` — value is spread broadly across many assets.
+
+---
+
 ## Use case: DEX — offers and offer history
 
 These endpoints cover an account's activity on the Stellar decentralised exchange.
@@ -588,6 +692,72 @@ curl -X POST "http://localhost:3000/account/freeze-status" \
 
 ---
 
+### `GET /account/:id/transaction-velocity`
+
+Returns how quickly the account is transacting. Compliance and fraud detection tools use this to spot automated activity or unusual behaviour: a sudden burst of transactions relative to the account's historical average is a common signal of a compromised key or a bot.
+
+The endpoint counts transactions per hour for the last 24 hours and compares the peak rate against the account's historical average.
+
+**Response fields:**
+
+| Field | Type | Description |
+|---|---|---|
+| `accountId` | string | The account the velocity was computed for |
+| `hourlyBreakdown` | array | Exactly 24 entries, one per hour, oldest first. Each entry has `hour` (ISO 8601 start of the hour) and `count` (transactions in that hour) |
+| `peakHour` | string \| null | ISO 8601 start of the hour with the highest `count`; `null` when there is no activity |
+| `peakCount` | number | Transaction count in the peak hour (0 when inactive) |
+| `averagePerHour` | number | Mean transactions per hour across the 24-hour window |
+| `velocityScore` | number | 0–100 indicating how unusual the rate is relative to the account's historical average. `0` for inactive accounts; higher values mean the current rate is further above normal |
+
+Returns `404 AccountNotFound` when the account does not exist on the configured network.
+
+```bash
+curl "http://localhost:3000/account/GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN/transaction-velocity"
+```
+
+```json
+{
+  "success": true,
+  "data": {
+    "accountId": "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN",
+    "hourlyBreakdown": [
+      { "hour": "2026-10-17T11:00:00.000Z", "count": 0 },
+      { "hour": "2026-10-17T12:00:00.000Z", "count": 1 },
+      { "hour": "2026-10-17T13:00:00.000Z", "count": 0 },
+      { "hour": "2026-10-17T14:00:00.000Z", "count": 2 },
+      { "hour": "2026-10-17T15:00:00.000Z", "count": 0 },
+      { "hour": "2026-10-17T16:00:00.000Z", "count": 0 },
+      { "hour": "2026-10-17T17:00:00.000Z", "count": 1 },
+      { "hour": "2026-10-17T18:00:00.000Z", "count": 0 },
+      { "hour": "2026-10-17T19:00:00.000Z", "count": 0 },
+      { "hour": "2026-10-17T20:00:00.000Z", "count": 0 },
+      { "hour": "2026-10-17T21:00:00.000Z", "count": 0 },
+      { "hour": "2026-10-17T22:00:00.000Z", "count": 0 },
+      { "hour": "2026-10-17T23:00:00.000Z", "count": 0 },
+      { "hour": "2026-10-18T00:00:00.000Z", "count": 0 },
+      { "hour": "2026-10-18T01:00:00.000Z", "count": 0 },
+      { "hour": "2026-10-18T02:00:00.000Z", "count": 0 },
+      { "hour": "2026-10-18T03:00:00.000Z", "count": 0 },
+      { "hour": "2026-10-18T04:00:00.000Z", "count": 0 },
+      { "hour": "2026-10-18T05:00:00.000Z", "count": 0 },
+      { "hour": "2026-10-18T06:00:00.000Z", "count": 0 },
+      { "hour": "2026-10-18T07:00:00.000Z", "count": 0 },
+      { "hour": "2026-10-18T08:00:00.000Z", "count": 0 },
+      { "hour": "2026-10-18T09:00:00.000Z", "count": 0 },
+      { "hour": "2026-10-18T10:00:00.000Z", "count": 14 }
+    ],
+    "peakHour": "2026-10-18T10:00:00.000Z",
+    "peakCount": 14,
+    "averagePerHour": 0.75,
+    "velocityScore": 87
+  }
+}
+```
+
+An account with no transactions in the window returns 24 zero-count entries, `peakHour: null`, `peakCount: 0`, `averagePerHour: 0` and `velocityScore: 0`.
+
+---
+
 ### `GET /account/:id/inactivity`
 
 Returns how many days have passed since the account's last transaction and a status label: `"active"` (< 30 days), `"idle"` (30–180 days), or `"dormant"` (> 180 days).
@@ -624,9 +794,10 @@ curl "http://localhost:3000/account/GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER
 
 ```
 1. GET /account/:id/risk-score      → overall risk rating and factors
-2. GET /account/:id/inactivity      → activity status
-3. GET /account/:id/freeze-status/:code/:issuer  → per-asset authorization
-4. POST /account/freeze-status      → bulk check across many accounts
+2. GET /account/:id/transaction-velocity  → unusual transaction-rate detection
+3. GET /account/:id/inactivity      → activity status
+4. GET /account/:id/freeze-status/:code/:issuer  → per-asset authorization
+5. POST /account/freeze-status      → bulk check across many accounts
 ```
 
 ### Build a multisig signing UI
@@ -651,6 +822,14 @@ curl "http://localhost:3000/account/GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER
 1. GET /account/:id/effects         → complete ledger effect stream
 2. GET /account/:id/transactions    → full transaction history
 3. GET /account/:id/payments        → payment-only filtered view
+```
+
+### Build an analytics dashboard
+
+```
+1. GET /account/:id/activity-heatmap  → when the account transacts (7×24 matrix)
+2. GET /account/:id/asset-diversity   → how concentrated the portfolio is (HHI)
+3. GET /account/:id/historical-balances → balance trend over time
 ```
 
 ---
