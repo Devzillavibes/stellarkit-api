@@ -2014,6 +2014,186 @@ router.get("/:id/effects", async (req, res, next) => {
 });
 
 /**
+ * GET /account/:id/claimable-balance-summary
+ *
+ * Returns a compact summary of an account's claimable balances without
+ * fetching the full paginated list. Categorises balances by eligibility:
+ *   - eligibleNow  — predicates are satisfied at the current time
+ *   - pending      — predicates exist but are not yet satisfied (time-locked)
+ *   - expired      — past their not_after predicate; can no longer be claimed
+ *
+ * totalValueXLM is computed from eligible balances only, treating every
+ * native XLM balance at face value. Non-XLM balances contribute 0 to the
+ * total (no cross-asset pricing is performed).
+ *
+ * Response shape:
+ *   {
+ *     success: true,
+ *     data: {
+ *       accountId:     string,
+ *       totalBalances: number,   // integer count of all claimable balances
+ *       eligibleNow:   number,   // integer
+ *       pending:       number,   // integer
+ *       expired:       number,   // integer
+ *       totalValueXLM: string    // seven-decimal string, eligible XLM only
+ *     }
+ *   }
+ *
+ * Returns 404 when the account does not exist.
+ * Response is cached with a 15 second TTL. Pass ?fresh=true to bypass.
+ *
+ * @example
+ *   GET /account/GABC.../claimable-balance-summary
+ */
+router.get("/:id/claimable-balance-summary", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const fresh = req.query.fresh === "true";
+    const cacheKey = `claimable-balance-summary:${id}`;
+
+    if (!fresh) {
+      const cached = cacheService.get(cacheKey);
+      if (cached) {
+        res.set("X-Cache", "HIT");
+        return success(res, cached);
+      }
+    }
+
+    // Ensure the account exists — raises 404 for unknown accounts.
+    await withHorizonTiming(req, () => server.loadAccount(id));
+
+    // Fetch all claimable balances for this claimant (up to 200 per page).
+    // For summary purposes a single page is sufficient; most accounts hold
+    // far fewer than 200 pending claimable balances.
+    const response = await server
+      .claimableBalances()
+      .claimant(id)
+      .limit(200)
+      .order("desc")
+      .call();
+
+    const records = response.records || [];
+    const now = Date.now();
+
+    let eligibleNow = 0;
+    let pending = 0;
+    let expired = 0;
+    let totalValueXLMRaw = 0;
+
+    for (const balance of records) {
+      // Find the predicate for this specific claimant.
+      const claimantEntry = (balance.claimants || []).find(
+        (c) => c.destination === id
+      );
+
+      const predicate = claimantEntry ? claimantEntry.predicate : null;
+      const eligibility = evaluateClaimPredicate(predicate, now);
+
+      if (eligibility === "eligible") {
+        eligibleNow++;
+        // Accumulate XLM value from eligible native balances only.
+        if (balance.asset === "native" || balance.asset_type === "native") {
+          totalValueXLMRaw += parseFloat(balance.amount || "0");
+        }
+      } else if (eligibility === "expired") {
+        expired++;
+      } else {
+        pending++;
+      }
+    }
+
+    const data = {
+      accountId: id,
+      totalBalances: records.length,
+      eligibleNow,
+      pending,
+      expired,
+      totalValueXLM: totalValueXLMRaw.toFixed(7),
+    };
+
+    cacheService.set(cacheKey, data, cacheTTL.claimableBalanceSummary);
+    res.set("X-Cache", "MISS");
+    return success(res, data);
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
+ * Evaluates a Horizon claimable balance predicate against the current time.
+ *
+ * Horizon predicates can be:
+ *   - null / { unconditional: true }   → always eligible
+ *   - { not: { unconditional: true } } → never eligible (treat as expired)
+ *   - { abs_before: "<ISO>" }          → eligible before that time (expired if past)
+ *   - { rel_before: "<seconds>" }      → treated as pending (relative to creation,
+ *                                        which we don't have here without extra fetch)
+ *   - { and: [...] } / { or: [...] }   → compound predicates
+ *
+ * Returns "eligible", "pending", or "expired".
+ *
+ * @param {object|null} predicate - Raw Horizon predicate object
+ * @param {number} nowMs - Current time in milliseconds
+ * @returns {"eligible"|"pending"|"expired"}
+ */
+function evaluateClaimPredicate(predicate, nowMs) {
+  // Null or missing predicate — unconditionally claimable
+  if (!predicate || predicate.unconditional === true) {
+    return "eligible";
+  }
+
+  // { not: { unconditional: true } } — permanently unclaimable
+  if (
+    predicate.not &&
+    predicate.not.unconditional === true
+  ) {
+    return "expired";
+  }
+
+  // Absolute time-lock: claimable only before this timestamp
+  if (predicate.abs_before) {
+    const deadline = new Date(predicate.abs_before).getTime();
+    if (Number.isFinite(deadline)) {
+      return nowMs < deadline ? "eligible" : "expired";
+    }
+  }
+
+  // Absolute time-lock as epoch seconds (abs_before_epoch)
+  if (predicate.abs_before_epoch != null) {
+    const deadline = Number(predicate.abs_before_epoch) * 1000;
+    if (Number.isFinite(deadline)) {
+      return nowMs < deadline ? "eligible" : "expired";
+    }
+  }
+
+  // Relative time-lock — requires creation time to evaluate; treat as pending
+  if (predicate.rel_before != null) {
+    return "pending";
+  }
+
+  // Compound AND — all sub-predicates must be eligible
+  if (Array.isArray(predicate.and)) {
+    const results = predicate.and.map((p) => evaluateClaimPredicate(p, nowMs));
+    if (results.every((r) => r === "eligible")) return "eligible";
+    if (results.some((r) => r === "expired")) return "expired";
+    return "pending";
+  }
+
+  // Compound OR — at least one sub-predicate must be eligible
+  if (Array.isArray(predicate.or)) {
+    const results = predicate.or.map((p) => evaluateClaimPredicate(p, nowMs));
+    if (results.some((r) => r === "eligible")) return "eligible";
+    if (results.every((r) => r === "expired")) return "expired";
+    return "pending";
+  }
+
+  // Unknown predicate shape — treat as pending (conservative)
+  return "pending";
+}
+
+/**
  * GET /account/:id/claimable-balances
  * Returns claimable balances for an account, categorized by claimability.
  *
@@ -2445,6 +2625,138 @@ router.get("/:id/asset-exposure", async (req, res, next) => {
       accountId: id,
       totalValueXLM: totalValueXLM.toFixed(7),
       exposure,
+      breakdown,
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
+ * GET /account/:id/asset-diversity
+ *
+ * Computes the Herfindahl-Hirschman Index (HHI) for the account's portfolio
+ * based on DEX order-book prices converted to XLM.
+ *
+ * HHI = Σ (portfolioPercent_i)²  where percent is on a 0–100 scale.
+ *   - HHI = 10000  → 100% in one asset (fully concentrated)
+ *   - HHI ≤ 1500   → well diversified
+ *   - 1500 < HHI ≤ 2500 → moderately diversified
+ *   - HHI > 2500   → concentrated
+ *
+ * Response shape:
+ *   {
+ *     success: true,
+ *     data: {
+ *       accountId:      string,
+ *       hhi:            number,   // integer 0–10000
+ *       diversityLevel: "diversified" | "moderate" | "concentrated",
+ *       breakdown: [
+ *         {
+ *           asset:            { code, issuer, type },
+ *           balance:          string,
+ *           valueInXLM:       string | null,
+ *           portfolioPercent: number | null   // 0–100 (two decimal places)
+ *         }
+ *       ]
+ *     }
+ *   }
+ *
+ * Returns 404 when the account does not exist.
+ *
+ * @example
+ *   GET /account/GABC.../asset-diversity
+ */
+router.get("/:id/asset-diversity", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const account = await withHorizonTiming(req, () => server.loadAccount(id));
+
+    // Gather all balances (native XLM + non-native assets)
+    const allBalances = (account.balances || []).filter(
+      (b) => isNativeAsset(b) || isNonNativeAsset(b)
+    );
+
+    // Price each asset in XLM via the DEX order book
+    const priced = await Promise.all(
+      allBalances.map(async (b) => {
+        const native = isNativeAsset(b);
+        const assetCode = native ? "XLM" : b.asset_code;
+        const assetIssuer = native ? null : b.asset_issuer;
+        const assetType = b.asset_type;
+        const balance = parseFloat(b.balance || "0");
+
+        let priceInXLM = native ? 1 : null;
+
+        if (!native) {
+          try {
+            const asset = new Asset(assetCode, assetIssuer);
+            const ob = await server
+              .orderbook(asset, Asset.native())
+              .limit(1)
+              .call();
+            const bids = ob.bids || [];
+            const asks = ob.asks || [];
+            const bid = bids.length ? parseFloat(bids[0].price) : null;
+            const ask = asks.length ? parseFloat(asks[0].price) : null;
+            if (bid !== null && ask !== null) priceInXLM = (bid + ask) / 2;
+            else if (bid !== null) priceInXLM = bid;
+            else if (ask !== null) priceInXLM = ask;
+          } catch (_) {
+            // No order book available — asset remains unpriced
+          }
+        }
+
+        const valueInXLM = priceInXLM !== null ? balance * priceInXLM : null;
+
+        return {
+          asset: normalizeAsset(assetCode, assetIssuer, assetType),
+          balance: toSevenDecimalString(balance),
+          valueInXLM,
+          _raw: valueInXLM,
+        };
+      })
+    );
+
+    // Compute total portfolio value in XLM (priced assets only)
+    const totalValueXLM = priced.reduce(
+      (sum, entry) => sum + (entry._raw !== null ? entry._raw : 0),
+      0
+    );
+
+    // Assign portfolio percentages and compute HHI
+    let hhi = 0;
+    const breakdown = priced.map((entry) => {
+      let portfolioPercent = null;
+      if (entry._raw !== null && totalValueXLM > 0) {
+        portfolioPercent = Number(
+          ((entry._raw / totalValueXLM) * 100).toFixed(2)
+        );
+        hhi += portfolioPercent * portfolioPercent;
+      }
+      return {
+        asset: entry.asset,
+        balance: entry.balance,
+        valueInXLM:
+          entry._raw !== null ? toSevenDecimalString(entry._raw) : null,
+        portfolioPercent,
+      };
+    });
+
+    // Round HHI to nearest integer (consistent with standard HHI reporting)
+    hhi = Math.round(hhi);
+
+    let diversityLevel;
+    if (hhi > 2500) diversityLevel = "concentrated";
+    else if (hhi > 1500) diversityLevel = "moderate";
+    else diversityLevel = "diversified";
+
+    return success(res, {
+      accountId: id,
+      hhi,
+      diversityLevel,
       breakdown,
     });
   } catch (err) {

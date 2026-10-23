@@ -166,6 +166,18 @@ const cacheTTL = {
     20000
   ),
 
+  /** /account/:id/claimable-balance-summary — claimable balance eligibility summary, 15 s default */
+  claimableBalanceSummary: msToSeconds(
+    process.env.CACHE_TTL_CLAIMABLE_BALANCE_SUMMARY_MS,
+    15000
+  ),
+
+  /** /network/fee-history — per-ledger fee statistics, 10 s default */
+  feeHistory: msToSeconds(
+    process.env.CACHE_TTL_FEE_HISTORY_MS,
+    10000
+  ),
+
   /** /soroban/contract/:id/storage — instance storage changes only on invoke */
   contractStorage: msToSeconds(
     process.env.CACHE_TTL_CONTRACT_STORAGE_MS,

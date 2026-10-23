@@ -1809,4 +1809,120 @@ router.get("/best-path/:sourceAsset/:destAsset", async (req, res, next) => {
   }
 });
 
+/**
+ * GET /dex/pool-share-value/:poolId/:shares
+ *
+ * Calculates the equivalent reserve amounts for a given number of pool shares
+ * in a Stellar constant-product AMM liquidity pool.
+ *
+ * Path params:
+ *   - poolId (string, required) — 64-character hexadecimal liquidity pool ID
+ *   - shares (string, required) — number of pool shares to value (supports decimals)
+ *
+ * Response shape:
+ *   {
+ *     success: true,
+ *     data: {
+ *       poolId:       string,
+ *       shares:       string,   // input shares formatted to 7 decimal places
+ *       totalShares:  string,   // pool's total issued shares (7 decimal places)
+ *       sharePercent: string,   // percentage of the pool owned (7 decimal places)
+ *       reserveA: { asset: { code, issuer, type }, equivalentAmount: string },
+ *       reserveB: { asset: { code, issuer, type }, equivalentAmount: string },
+ *       feeBp:        number,   // pool fee in basis points (e.g. 30 = 0.30%)
+ *     }
+ *   }
+ *
+ * Returns 400 when shares is not a valid positive number or poolId is invalid.
+ * Returns 404 when the pool does not exist on Horizon.
+ *
+ * @example
+ * GET /dex/pool-share-value/67339253ccd0390f4886b5952d7f8d68f70f61280d908e234190c609c95b6026/100
+ */
+router.get("/pool-share-value/:poolId/:shares", async (req, res, next) => {
+  try {
+    const { poolId, shares: sharesParam } = req.params;
+
+    // Validate pool ID — 64-char lowercase hex
+    if (!/^[0-9a-f]{64}$/i.test(poolId)) {
+      const err = new Error(
+        `"${String(poolId).slice(0, 70)}" is not a valid liquidity pool ID. Pool IDs are 64-character hexadecimal strings.`
+      );
+      err.isValidation = true;
+      err.field = "poolId";
+      err.receivedValue = String(poolId).slice(0, 70);
+      err.expectedFormat = "64-character hexadecimal string";
+      err.status = 400;
+      return next(err);
+    }
+
+    // Validate shares — must be a finite positive number
+    const sharesValue = parseFloat(sharesParam);
+    if (!Number.isFinite(sharesValue) || sharesValue <= 0) {
+      const err = new Error(
+        `Query parameter 'shares': must be a positive number (e.g. 100 or 50.5). Received: "${sharesParam}".`
+      );
+      err.isValidation = true;
+      err.field = "shares";
+      err.receivedValue = sharesParam;
+      err.expectedFormat = "positive decimal number";
+      err.status = 400;
+      return next(err);
+    }
+
+    // Fetch live pool data from Horizon
+    let pool;
+    try {
+      pool = await server.liquidityPools().liquidityPoolId(poolId).call();
+    } catch (err) {
+      if (err.response && err.response.status === 404) {
+        const notFound = new StellarKitError(
+          `Liquidity pool "${poolId}" was not found on the Stellar network.`,
+          404,
+          "LiquidityPoolNotFound",
+          null,
+          "Verify the pool ID is correct and the pool exists on the configured network."
+        );
+        return next(notFound);
+      }
+      throw err;
+    }
+
+    const totalShares = parseFloat(pool.total_shares || "0");
+    const sharePercent = totalShares > 0 ? (sharesValue / totalShares) * 100 : 0;
+    const ratio = totalShares > 0 ? sharesValue / totalShares : 0;
+
+    const reserveA = pool.reserves[0];
+    const reserveB = pool.reserves[1];
+    const equivalentA = parseFloat(reserveA.amount) * ratio;
+    const equivalentB = parseFloat(reserveB.amount) * ratio;
+
+    return success(res, {
+      poolId: pool.id,
+      shares: sharesValue.toFixed(7),
+      totalShares: totalShares.toFixed(7),
+      sharePercent: sharePercent.toFixed(7),
+      reserveA: {
+        asset: normalizeAsset(
+          reserveA.asset === "native" ? "XLM" : reserveA.asset.split(":")[0],
+          reserveA.asset === "native" ? null : reserveA.asset.split(":")[1],
+          reserveA.asset === "native" ? "native" : undefined,
+        ),
+        equivalentAmount: equivalentA.toFixed(7),
+      },
+      reserveB: {
+        asset: normalizeAsset(
+          reserveB.asset === "native" ? "XLM" : reserveB.asset.split(":")[0],
+          reserveB.asset === "native" ? null : reserveB.asset.split(":")[1],
+          reserveB.asset === "native" ? "native" : undefined,
+        ),
+        equivalentAmount: equivalentB.toFixed(7),
+      },
+      feeBp: pool.fee_bp || 30,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 module.exports = router;
